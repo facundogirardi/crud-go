@@ -52,8 +52,10 @@ La ventaja de separar así es que si mañana querés cambiar SQLite por PostgreS
 ### `go.mod`
 Es la "ficha" del proyecto, como el `package.json` en Node.js. Indica:
 - el **nombre del módulo** (`crud-go`),
-- la **versión mínima de Go** (1.22, necesaria para las rutas del tipo `GET /productos/{id}`),
-- las **dependencias externas**. La única es `modernc.org/sqlite`, el driver de SQLite. Se agrega sola al ejecutar `go mod tidy`.
+- la **versión mínima de Go** (`go 1.26.0`). Lo importante es tener Go 1.22 o más nuevo, porque desde esa versión existen las rutas que incluyen el método y parámetros, como `GET /productos/{id}`,
+- las **dependencias externas**. La única que usamos directamente es `modernc.org/sqlite`, el driver de SQLite. Se agrega sola al ejecutar `go mod tidy`.
+
+Las líneas marcadas `// indirect` son dependencias **de nuestras dependencias**: el driver de SQLite las necesita, nosotros no las usamos. Go las anota para que todos compilen con exactamente las mismas versiones.
 
 ### `go.sum`
 Lo crea Go automáticamente al descargar las dependencias. Guarda una huella (hash) de cada una para garantizar que nadie las modificó. **No se edita a mano**, pero sí conviene subirlo al repositorio.
@@ -68,6 +70,14 @@ Es lo primero que se ejecuta (función `main`). Hace cuatro cosas:
 4. Levanta el servidor HTTP.
 
 También define el middleware `logger`, una función que envuelve a todas las rutas y escribe en consola cada petición que llega (por ejemplo `GET /productos`).
+
+**Conceptos de Go que aparecen acá:**
+- **`package main` y `func main()`**: un programa ejecutable en Go siempre tiene un paquete `main` con una función `main`. Todos los `.go` de la carpeta son del mismo paquete, por eso `main.go` puede usar `NewStore` (de `store.go`) y `API` (de `handlers.go`) sin importar nada.
+- **Errores como valores**: Go no tiene excepciones. Las funciones que pueden fallar devuelven un `error` como último valor y se revisa con `if err != nil`. Por ejemplo, `store, err := NewStore(rutaDB)`.
+- **`log.Fatalf`**: escribe el mensaje y termina el programa. Se usa cuando no tiene sentido seguir, por ejemplo si no se puede abrir la base.
+- **`defer store.Close()`**: deja anotado que `Close` se ejecute cuando termine `main`. Así la base se cierra siempre, aunque el programa salga por un error.
+- **Middleware**: `logger` recibe un `http.Handler` (las rutas) y devuelve otro `http.Handler` que primero escribe el log y después llama al original con `next.ServeHTTP(w, r)`. Con el mismo patrón se pueden agregar autenticación, CORS, medición de tiempos, etc.
+- **`http.ListenAndServe`**: deja el programa escuchando en el puerto. No termina mientras el servidor esté funcionando; si devuelve algo, es porque hubo un error (por ejemplo, el puerto ya está en uso).
 
 ### `handlers.go`: la capa HTTP
 Recibe las peticiones y decide qué responder. No sabe nada de SQL, solo le pide cosas al store.
@@ -88,6 +98,24 @@ Recibe las peticiones y decide qué responder. No sabe nada de SQL, solo le pide
 - `manejarError`: traduce errores a códigos HTTP. "No encontrado" se convierte en **404** y cualquier otro error en **500**. El detalle de un 500 se registra en consola, no se le muestra al cliente.
 - `responderJSON` y `responderError`: escriben la respuesta en formato JSON.
 
+**Recorrido de una petición, paso a paso.** Qué pasa cuando llega `POST /productos` con `{"nombre":"Mate","precio":1500,"stock":10}`:
+
+1. `logger` (en `main.go`) escribe `POST /productos` en la consola.
+2. El `ServeMux` busca qué ruta coincide con el método y la URL, y llama a `a.crear`.
+3. `crear` llama a `leerProducto`, que convierte el JSON en un `Producto`, le quita los espacios al nombre (`strings.TrimSpace`) y lo valida. Si algo está mal, ya respondió 400 y devuelve `ok = false`, así que `crear` termina con `return`.
+4. Si los datos son válidos, `crear` llama a `a.store.Crear(...)`, que hace el `INSERT` y devuelve el producto con su `id` y fechas.
+5. `responderJSON` pone el header `Content-Type: application/json`, el código **201** y escribe el producto en JSON.
+
+**Conceptos de Go que aparecen acá:**
+- **Métodos**: `func (a *API) crear(...)` es una función que pertenece al tipo `API`. Por eso adentro se puede usar `a.store`.
+- **Firma de un handler**: todas las funciones de ruta reciben `w http.ResponseWriter` (donde se escribe la respuesta) y `r *http.Request` (la petición: método, URL, headers, cuerpo).
+- **Patrón `(valor, ok)`**: `leerID` y `leerProducto` devuelven el dato y un `bool`. Si `ok` es `false`, el error ya se le respondió al cliente y el handler solo tiene que salir. Así no se repite el código de error en cada handler.
+- **`r.PathValue("id")`**: obtiene la parte `{id}` de la URL. Siempre es texto; `strconv.Atoi` lo convierte a número.
+- **`r.Context()`**: se le pasa al store. Si el cliente cancela la petición (cierra la conexión), la consulta a la base también se cancela.
+- **`errors.Is(err, ErrNoEncontrado)`**: compara el error con uno conocido. Es la forma de Go de decir "si es este error en particular, hacé tal cosa".
+
+**PUT reemplaza todo:** como `actualizar` usa la misma validación que `crear`, hay que mandar `nombre`, `precio` y `stock`. Si falta el nombre, responde 400; si faltan `precio` o `stock`, se guardan en `0` (en Go, un campo que no viene en el JSON queda con su "valor cero").
+
 ### `store.go`: la capa de datos
 Todo lo relacionado con la base de datos.
 
@@ -107,7 +135,23 @@ Todo lo relacionado con la base de datos.
 - **`Crear`, `Listar`, `Obtener`, `Actualizar`, `Eliminar`**: una función por operación del CRUD. Cada una ejecuta su sentencia SQL (`INSERT`, `SELECT`, `UPDATE`, `DELETE`). Todas usan `?` para los valores, lo que **protege contra inyección SQL**.
 - **`formatear` y `escanear`**: auxiliares para convertir las fechas a texto y para pasar una fila de la base a un `Producto`.
 
-Detalle: `db.SetMaxOpenConns(1)` limita a una sola conexión, porque SQLite permite un único escritor a la vez. Así se evitan errores de "database is locked".
+Detalle: `db.SetMaxOpenConns(1)` limita a una sola conexión, porque SQLite permite un único escritor a la vez. Así se evitan errores de "database is locked". Además, con `":memory:"` cada conexión nueva crearía otra base vacía; con una sola conexión, la base en memoria se mantiene entre consultas.
+
+**Cómo funciona cada operación:**
+
+| Función | SQL | Cómo se entera de que el producto no existe |
+|---------|-----|---------------------------------------------|
+| `Crear` | `INSERT` | No aplica. Usa `LastInsertId()` para saber qué `id` le asignó la base |
+| `Listar` | `SELECT ... ORDER BY id` | No aplica. Si no hay productos devuelve `[]` (lista vacía), no `null` |
+| `Obtener` | `SELECT ... WHERE id = ?` | La base devuelve `sql.ErrNoRows` y se traduce a `ErrNoEncontrado` |
+| `Actualizar` | `UPDATE ... WHERE id = ?` | `RowsAffected()` da 0 filas modificadas. Después llama a `Obtener` para devolver el producto como quedó guardado |
+| `Eliminar` | `DELETE ... WHERE id = ?` | `RowsAffected()` da 0 filas borradas |
+
+**Conceptos de Go que aparecen acá:**
+- **El import con `_`**: `_ "modernc.org/sqlite"` importa el paquete solo para que se registre como driver. Nunca lo usamos por nombre: hablamos con la base a través de `database/sql`, que es la librería estándar y funciona igual con cualquier base.
+- **Structs y etiquetas**: `Producto` agrupa los campos. Las etiquetas `` `json:"nombre"` `` le dicen a `encoding/json` cómo se llama cada campo en el JSON (en Go los campos van con mayúscula para ser visibles desde otros paquetes, pero en el JSON queremos minúsculas).
+- **Interfaces**: `escaneable` es una interfaz con un solo método, `Scan`. Tanto `*sql.Row` (una fila, en `Obtener`) como `*sql.Rows` (varias filas, en `Listar`) lo tienen, así que `escanear` sirve para los dos. En Go no hace falta declarar que un tipo "implementa" una interfaz: alcanza con que tenga los métodos.
+- **Fechas**: se guardan como texto en formato RFC 3339 (`2026-11-23T14:00:00Z`), en UTC, para que se lean bien si abrís la base. `escanear` las vuelve a convertir a `time.Time`. `Actualizar` cambia `actualizado_en` pero nunca toca `creado_en`.
 
 ### `handlers_test.go`: los tests
 Prueban la API de punta a punta, como lo haría un cliente real, pero sin levantar el servidor a mano. Cada test usa una base en memoria nueva, así no se pisan entre sí ni dejan archivos.
@@ -115,6 +159,8 @@ Prueban la API de punta a punta, como lo haría un cliente real, pero sin levant
 - **`TestCRUDCompleto`**: crea, lista, obtiene, actualiza y elimina un producto, y verifica cada respuesta.
 - **`TestNoEncontrado`**: comprueba que pedir, actualizar o borrar un ID inexistente devuelve 404.
 - **`TestValidaciones`**: manda datos inválidos (nombre vacío, precio negativo, JSON roto, campo extra, id no numérico) y espera 400.
+
+Cómo funcionan por dentro está explicado en [Cómo funcionan los tests](#cómo-funcionan-los-tests).
 
 ### `crud-go.postman_collection.json`: colección de Postman
 Archivo que **Postman** puede importar. Trae ya armadas todas las peticiones para probar la API, así no hay que cargarlas a mano.
@@ -159,6 +205,7 @@ go mod tidy
 ```powershell
 go test -v
 ```
+Tienen que aparecer los tres tests con `PASS`. Más opciones en [Cómo funcionan los tests](#cómo-funcionan-los-tests).
 
 ### 4. Levantar el servidor
 ```powershell
@@ -166,9 +213,11 @@ go run .
 ```
 
 ### 5. Probar la API (desde otra terminal)
+Estos comandos son para **PowerShell 7.3 o más nuevo** (`pwsh`, el que suele abrir VS Code). Para ver qué versión tenés: `$PSVersionTable.PSVersion`.
+
 ```powershell
 # Crear
-curl.exe -X POST localhost:8080/productos -H "Content-Type: application/json" -d '{\"nombre\":\"Mate\",\"precio\":1500,\"stock\":10}'
+curl.exe -X POST localhost:8080/productos -H "Content-Type: application/json" -d '{"nombre":"Mate","precio":1500,"stock":10}'
 
 # Listar todos
 curl.exe localhost:8080/productos
@@ -177,11 +226,30 @@ curl.exe localhost:8080/productos
 curl.exe localhost:8080/productos/1
 
 # Actualizar
-curl.exe -X PUT localhost:8080/productos/1 -d '{\"nombre\":\"Mate imperial\",\"precio\":2500,\"stock\":5}'
+curl.exe -X PUT localhost:8080/productos/1 -H "Content-Type: application/json" -d '{"nombre":"Mate imperial","precio":2500,"stock":5}'
 
 # Eliminar
 curl.exe -X DELETE localhost:8080/productos/1
 ```
+
+> **¿Por qué `curl.exe` y no `curl`?** En Windows PowerShell 5.1, `curl` es un alias de `Invoke-WebRequest`, que usa otros parámetros. Escribiendo `curl.exe` te asegurás de usar el curl real.
+
+**Si usás Windows PowerShell 5.1** (el `powershell.exe` que viene con Windows), esa versión les quita las comillas dobles a los argumentos que les pasa a programas externos como `curl.exe`, así que hay que escaparlas con `\"`:
+```powershell
+curl.exe -X POST localhost:8080/productos -H "Content-Type: application/json" -d '{\"nombre\":\"Mate\",\"precio\":1500,\"stock\":10}'
+```
+⚠️ En PowerShell 7.3+ **no** uses `\"`: las barras le llegan al servidor y responde
+`{"error":"JSON inválido: invalid character '\\' looking for beginning of object key string"}`.
+
+**Alternativas que funcionan en cualquier versión:**
+```powershell
+# Con el cmdlet nativo de PowerShell (no tiene problemas de comillas)
+Invoke-RestMethod -Method Post -Uri localhost:8080/productos -ContentType "application/json" -Body '{"nombre":"Mate","precio":1500,"stock":10}'
+
+# Con el JSON guardado en un archivo producto.json
+curl.exe -X POST localhost:8080/productos -H "Content-Type: application/json" --data-binary "@producto.json"
+```
+En Git Bash, Linux o Mac no hay ningún problema: se usa el comando sin barras y con `curl` a secas.
 
 ### 6. Probar con Postman (alternativa a curl)
 El proyecto incluye la colección `crud-go.postman_collection.json` con todos los endpoints ya configurados.
@@ -288,6 +356,126 @@ go build -ldflags "-s -w" -o crud.exe .
 
 - **No hace falta para desarrollar:** `go run .` compila y ejecuta en un solo paso.
 - **No se sube a git:** es un archivo generado que se puede recrear en cualquier momento, por eso está en el `.gitignore`. Se puede borrar sin problema.
+
+---
+
+## Cómo funcionan los tests
+
+Go trae su propio sistema de tests, no hay que instalar nada. Lo que hace falta saber:
+
+### Las reglas de Go para los tests
+- Los tests van en archivos que terminan en **`_test.go`**. `go build` los ignora: no forman parte de `crud.exe`.
+- Cada test es una función que empieza con **`Test`** y recibe `t *testing.T`, por ejemplo `func TestValidaciones(t *testing.T)`. `go test` las encuentra solas por el nombre.
+- `handlers_test.go` está en el mismo paquete (`package main`), así que puede usar todo lo del proyecto: `NewStore`, `API`, `Producto`, etc.
+- Un test **pasa** si termina sin reportar errores. Para marcarlo como fallido se usa:
+  - **`t.Errorf(...)`**: anota el error y **sigue** ejecutando. Sirve cuando se revisan varios casos y conviene ver todos los que fallan.
+  - **`t.Fatalf(...)`**: anota el error y **corta** ese test. Sirve cuando seguir no tiene sentido (si no se pudo crear el producto, no se puede probar actualizarlo).
+
+### Las dos funciones de apoyo
+**`nuevoServidor(t)`** prepara un servidor limpio para cada test:
+1. Crea un store con `NewStore(":memory:")`: una base SQLite que vive en memoria, arranca vacía y desaparece al terminar. No toca `productos.db`.
+2. Levanta la API con `httptest.NewServer(...)`. Es un servidor HTTP real, pero en un puerto libre elegido al azar (por ejemplo `http://127.0.0.1:53124`), así que no choca con el servidor que puedas tener corriendo en el 8080. La dirección queda en `srv.URL`.
+3. Con `t.Cleanup(...)` deja anotado que al terminar el test se cierren el servidor y la base.
+
+**`pedir(t, metodo, url, cuerpo, destino)`** hace una petición HTTP, igual que curl o Postman:
+1. Arma la petición con el método, la URL y el cuerpo JSON.
+2. La envía con `http.DefaultClient.Do(req)`.
+3. Si se le pasa `destino`, convierte el JSON de la respuesta en ese valor (por ejemplo, un `Producto`).
+4. Devuelve el código de estado (201, 404, etc.) para que el test lo compare con el esperado.
+
+Las dos llaman a `t.Helper()`. Eso hace que, si fallan, Go muestre la línea del test que las llamó y no una línea de adentro de la función auxiliar, que es mucho más útil para encontrar el problema.
+
+### Qué prueba cada test
+**`TestCRUDCompleto`**: sigue la vida completa de un producto, en orden. Como la base arranca vacía, el primer producto siempre tiene `id` 1.
+
+| Paso | Petición | Qué verifica |
+|------|----------|--------------|
+| 1 | `POST /productos` | Responde 201 y devuelve `id` 1 con los mismos datos enviados |
+| 2 | `GET /productos` | Responde 200 y la lista tiene 1 producto |
+| 3 | `GET /productos/1` | Responde 200 y el nombre es "Mate" |
+| 4 | `PUT /productos/1` | Responde 200, los datos cambiaron y `creado_en` sigue igual |
+| 5 | `DELETE /productos/1` | Responde 204 |
+| 6 | `GET /productos/1` | Responde 404: el producto ya no existe |
+
+**`TestNoEncontrado`**: prueba `GET`, `PUT` y `DELETE` sobre `/productos/99`, que no existe, y espera 404 en los tres.
+
+**`TestValidaciones`**: manda cuerpos inválidos a `POST /productos` y espera 400 en todos. Al final prueba `GET /productos/abc` (id que no es número), que también tiene que dar 400.
+
+| Caso | Cuerpo enviado | Qué regla de `leerProducto` lo rechaza |
+|------|----------------|----------------------------------------|
+| nombre vacío | `{"nombre":"  ",...}` | Después de `TrimSpace` el nombre queda vacío |
+| precio negativo | `{"precio":-1,...}` | `p.Precio < 0` |
+| stock negativo | `{"stock":-1,...}` | `p.Stock < 0` |
+| JSON roto | `{"nombre":` | `Decode` no puede leerlo |
+| campo extra | `{...,"color":"rojo"}` | `DisallowUnknownFields` |
+
+### Tests de tabla
+`TestNoEncontrado` y `TestValidaciones` usan un patrón muy común en Go: los **tests de tabla** (*table-driven tests*). En vez de escribir un bloque de código por caso, se arma una lista (o un `map`) con los datos de cada caso y un `for` los recorre:
+
+```go
+casos := map[string]string{
+    "precio negativo": `{"nombre":"X","precio":-1,"stock":1}`,
+    "JSON roto":       `{"nombre":`,
+}
+for nombre, cuerpo := range casos {
+    if st := pedir(t, "POST", base, cuerpo, nil); st != http.StatusBadRequest {
+        t.Errorf("%s: status %d, se esperaba 400", nombre, st)
+    }
+}
+```
+
+Para probar un caso nuevo alcanza con agregar una línea a la tabla. Y como usa `t.Errorf` (no `Fatalf`), si fallan varios casos se ven todos juntos.
+
+### Comandos
+| Comando | Qué hace |
+|---------|----------|
+| `go test` | Corre todos los tests y solo muestra el resultado final |
+| `go test -v` | Muestra cada test con su resultado (*verbose*) |
+| `go test -run Validaciones` | Corre solo los tests cuyo nombre coincide con el texto (es una expresión regular) |
+| `go test -count=1` | Obliga a correrlos de nuevo. Sin esto, si el código no cambió, Go puede mostrar el resultado guardado con `(cached)` |
+| `go test -cover` | Muestra qué porcentaje del código se ejecutó durante los tests |
+
+Salida de `go test -v` cuando todo está bien:
+```
+=== RUN   TestCRUDCompleto
+--- PASS: TestCRUDCompleto (0.01s)
+=== RUN   TestNoEncontrado
+--- PASS: TestNoEncontrado (0.00s)
+=== RUN   TestValidaciones
+--- PASS: TestValidaciones (0.00s)
+PASS
+ok  	crud-go	0.330s
+```
+
+Con `go test -cover` hoy da `coverage: 75.2% of statements`. Lo que queda sin cubrir son sobre todo los caminos de error interno (500), como que falle la base de datos, que son difíciles de provocar en un test.
+
+**Cuando un test falla**, Go muestra `--- FAIL`, el archivo, la línea y el mensaje que se escribió en `t.Errorf` o `t.Fatalf`. Por ejemplo:
+```
+--- FAIL: TestValidaciones (0.00s)
+    handlers_test.go:123: precio negativo: status 201, se esperaba 400
+FAIL
+```
+Eso dice que la API aceptó un precio negativo (201) cuando tendría que haberlo rechazado (400).
+
+### Ejercicio: agregar tu propio test
+Una buena forma de practicar es agregar un test al final de `handlers_test.go`. Por ejemplo, para comprobar que la lista arranca vacía:
+
+```go
+func TestListaVacia(t *testing.T) {
+    srv := nuevoServidor(t)
+
+    var lista []Producto
+    st := pedir(t, "GET", srv.URL+"/productos", "", &lista)
+    if st != http.StatusOK {
+        t.Fatalf("status %d, se esperaba 200", st)
+    }
+    if len(lista) != 0 {
+        t.Fatalf("se esperaba lista vacía, llegaron %d productos", len(lista))
+    }
+}
+```
+
+Corrélo con `go test -v -run ListaVacia`. Otras ideas: probar que un `id` negativo da 400, o que un nombre con espacios alrededor (`"  Mate  "`) se guarda como `"Mate"`.
 
 ---
 
