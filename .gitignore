@@ -1,0 +1,6 @@
+# Ejecutables generados con go build
+*.exe
+crud
+
+# Base de datos local (se crea sola al arrancar)
+*.db

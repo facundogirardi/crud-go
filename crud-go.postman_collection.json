@@ -1,0 +1,93 @@
+{
+  "info": {
+    "name": "CRUD Productos (Go)",
+    "description": "Endpoints del CRUD de productos. Levantar el servidor con `go run .` antes de usarla.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:8080" },
+    { "key": "id", "value": "1" }
+  ],
+  "item": [
+    {
+      "name": "Crear producto",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Status 201', () => pm.response.to.have.status(201));",
+              "const p = pm.response.json();",
+              "if (p.id) { pm.collectionVariables.set('id', p.id); }"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"nombre\": \"Mate\",\n  \"precio\": 1500,\n  \"stock\": 10\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": "{{baseUrl}}/productos"
+      }
+    },
+    {
+      "name": "Listar productos",
+      "request": {
+        "method": "GET",
+        "url": "{{baseUrl}}/productos"
+      }
+    },
+    {
+      "name": "Obtener producto",
+      "request": {
+        "method": "GET",
+        "url": "{{baseUrl}}/productos/{{id}}"
+      }
+    },
+    {
+      "name": "Actualizar producto",
+      "request": {
+        "method": "PUT",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"nombre\": \"Mate imperial\",\n  \"precio\": 2500,\n  \"stock\": 5\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": "{{baseUrl}}/productos/{{id}}"
+      }
+    },
+    {
+      "name": "Eliminar producto",
+      "request": {
+        "method": "DELETE",
+        "url": "{{baseUrl}}/productos/{{id}}"
+      }
+    },
+    {
+      "name": "Error: datos inválidos (400)",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"nombre\": \"\",\n  \"precio\": -1,\n  \"stock\": 1\n}",
+          "options": { "raw": { "language": "json" } }
+        },
+        "url": "{{baseUrl}}/productos"
+      }
+    },
+    {
+      "name": "Error: no encontrado (404)",
+      "request": {
+        "method": "GET",
+        "url": "{{baseUrl}}/productos/9999"
+      }
+    }
+  ]
+}
